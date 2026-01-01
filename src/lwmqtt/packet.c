@@ -248,29 +248,8 @@ lwmqtt_err_t lwmqtt_decode_connack(uint8_t *buf, size_t buf_len, bool *session_p
   // get session present
   *session_present = lwmqtt_read_bits(flags, 0, 1) == 1;
 
-  // get return code
-  switch (raw_return_code) {
-    case 0:
-      *return_code = LWMQTT_CONNECTION_ACCEPTED;
-      break;
-    case 1:
-      *return_code = LWMQTT_UNACCEPTABLE_PROTOCOL;
-      break;
-    case 2:
-      *return_code = LWMQTT_IDENTIFIER_REJECTED;
-      break;
-    case 3:
-      *return_code = LWMQTT_SERVER_UNAVAILABLE;
-      break;
-    case 4:
-      *return_code = LWMQTT_BAD_USERNAME_OR_PASSWORD;
-      break;
-    case 5:
-      *return_code = LWMQTT_NOT_AUTHORIZED;
-      break;
-    default:
-      *return_code = LWMQTT_UNKNOWN_RETURN_CODE;
-  }
+  // get return code - direct cast for valid range (0-5), unknown otherwise
+  *return_code = (raw_return_code <= 5) ? (lwmqtt_return_code_t)raw_return_code : LWMQTT_UNKNOWN_RETURN_CODE;
 
   return LWMQTT_SUCCESS;
 }
@@ -401,21 +380,9 @@ lwmqtt_err_t lwmqtt_decode_publish(uint8_t *buf, size_t buf_len, bool *dup, uint
   // get retained
   msg->retained = lwmqtt_read_bits(header, 0, 1) == 1;
 
-  // get qos
-  switch (lwmqtt_read_bits(header, 1, 2)) {
-    case 0:
-      msg->qos = LWMQTT_QOS0;
-      break;
-    case 1:
-      msg->qos = LWMQTT_QOS1;
-      break;
-    case 2:
-      msg->qos = LWMQTT_QOS2;
-      break;
-    default:
-      msg->qos = LWMQTT_QOS0;
-      break;
-  }
+  // get qos - direct cast is safe since enum values match (0,1,2)
+  uint8_t qos_val = lwmqtt_read_bits(header, 1, 2);
+  msg->qos = (qos_val <= 2) ? (lwmqtt_qos_t)qos_val : LWMQTT_QOS0;
 
   // read remaining length
   uint32_t rem_len;
@@ -636,8 +603,8 @@ lwmqtt_err_t lwmqtt_decode_suback(uint8_t *buf, size_t buf_len, uint16_t *packet
 
   // read all suback codes
   for (*count = 0; *count < (int)rem_len - 2; (*count)++) {
-    // check max count
-    if (*count > max_count) {
+    // check max count *before* writing to avoid overflow when count == max_count
+    if (*count >= max_count) {
       return LWMQTT_SUBACK_ARRAY_OVERFLOW;
     }
 
@@ -648,21 +615,8 @@ lwmqtt_err_t lwmqtt_decode_suback(uint8_t *buf, size_t buf_len, uint16_t *packet
       return err;
     }
 
-    // set qos level
-    switch (raw_qos_level) {
-      case 0:
-        granted_qos_levels[*count] = LWMQTT_QOS0;
-        break;
-      case 1:
-        granted_qos_levels[*count] = LWMQTT_QOS1;
-        break;
-      case 2:
-        granted_qos_levels[*count] = LWMQTT_QOS2;
-        break;
-      default:
-        granted_qos_levels[*count] = LWMQTT_QOS_FAILURE;
-        break;
-    }
+    // set qos level - direct cast for valid values (0,1,2), failure (128) otherwise
+    granted_qos_levels[*count] = (raw_qos_level <= 2) ? (lwmqtt_qos_t)raw_qos_level : LWMQTT_QOS_FAILURE;
   }
 
   return LWMQTT_SUCCESS;

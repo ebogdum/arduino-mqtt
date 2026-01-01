@@ -3,6 +3,27 @@
 
 #include "lwmqtt.h"
 
+// Compiler hints for better optimization
+#if defined(__GNUC__) || defined(__clang__)
+  #define LWMQTT_INLINE static inline __attribute__((always_inline))
+  #define LWMQTT_LIKELY(x)   __builtin_expect(!!(x), 1)
+  #define LWMQTT_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+  #define LWMQTT_INLINE static inline
+  #define LWMQTT_LIKELY(x)   (x)
+  #define LWMQTT_UNLIKELY(x) (x)
+#endif
+
+// Inline macro versions for hot paths (avoids function call overhead)
+#define LWMQTT_READ_BITS_FAST(byte, pos, num) \
+  (((byte) >> (pos)) & ((1u << (num)) - 1))
+
+#define LWMQTT_WRITE_BITS_FAST(byte_ptr, value, pos, num) \
+  do { \
+    uint8_t mask = ((1u << (num)) - 1) << (pos); \
+    *(byte_ptr) = (*(byte_ptr) & ~mask) | (((value) << (pos)) & mask); \
+  } while(0)
+
 /**
  * Reads bits from a byte.
  *

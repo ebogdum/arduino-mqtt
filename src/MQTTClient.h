@@ -1,26 +1,30 @@
 #ifndef MQTT_CLIENT_H
 #define MQTT_CLIENT_H
 
-// include functional API if possible. remove min and max macros for some
-// platforms as they will be defined again by Arduino later
-#if defined(ESP8266) || (defined ESP32)
-#include <functional>
-#define MQTT_HAS_FUNCTIONAL 1
-#elif defined(__has_include)
-#if __has_include(<functional>)
-#if defined(min)
-#undef min
-#endif
-#if defined(max)
-#undef max
-#endif
-#include <functional>
-#define MQTT_HAS_FUNCTIONAL 1
+// Allow users to disable std::function support to save ~64 bytes RAM per client
+// Define MQTT_NO_FUNCTIONAL before including this header to disable
+#ifndef MQTT_NO_FUNCTIONAL
+  #if defined(ESP8266) || (defined ESP32)
+  #include <functional>
+  #define MQTT_HAS_FUNCTIONAL 1
+  #elif defined(__has_include)
+  #if __has_include(<functional>)
+  #if defined(min)
+  #undef min
+  #endif
+  #if defined(max)
+  #undef max
+  #endif
+  #include <functional>
+  #define MQTT_HAS_FUNCTIONAL 1
+  #else
+  #define MQTT_HAS_FUNCTIONAL 0
+  #endif
+  #else
+  #define MQTT_HAS_FUNCTIONAL 0
+  #endif
 #else
-#define MQTT_HAS_FUNCTIONAL 0
-#endif
-#else
-#define MQTT_HAS_FUNCTIONAL 0
+  #define MQTT_HAS_FUNCTIONAL 0
 #endif
 
 #include <Arduino.h>
@@ -30,6 +34,13 @@
 extern "C" {
 #include "lwmqtt/lwmqtt.h"
 }
+
+// Force inline for performance-critical functions
+#if defined(__GNUC__) || defined(__clang__)
+  #define MQTT_ALWAYS_INLINE __attribute__((always_inline)) inline
+#else
+  #define MQTT_ALWAYS_INLINE inline
+#endif
 
 typedef uint32_t (*MQTTClientClockSource)();
 
@@ -47,56 +58,96 @@ class MQTTClient;
 
 typedef void (*MQTTClientCallbackSimple)(String &topic, String &payload);
 typedef void (*MQTTClientCallbackAdvanced)(MQTTClient *client, char topic[], char bytes[], int length);
+typedef void (*MQTTClientCallbackRaw)(MQTTClient *client, const char *topic, size_t topic_len, const char *payload,
+                    size_t payload_len);
 #if MQTT_HAS_FUNCTIONAL
 typedef std::function<void(String &topic, String &payload)> MQTTClientCallbackSimpleFunction;
 typedef std::function<void(MQTTClient *client, char topic[], char bytes[], int length)>
     MQTTClientCallbackAdvancedFunction;
+typedef std::function<void(MQTTClient *client, const char *topic, size_t topic_len, const char *payload,
+               size_t payload_len)>
+  MQTTClientCallbackRawFunction;
 #endif
 
-typedef struct {
-  MQTTClient *client = nullptr;
-  MQTTClientCallbackSimple simple = nullptr;
-  MQTTClientCallbackAdvanced advanced = nullptr;
+// Callback type enumeration for union-based storage
+enum MQTTCallbackType : uint8_t {
+  MQTT_CB_NONE = 0,
+  MQTT_CB_SIMPLE = 1,
+  MQTT_CB_ADVANCED = 2,
+  MQTT_CB_RAW = 3,
 #if MQTT_HAS_FUNCTIONAL
-  MQTTClientCallbackSimpleFunction functionSimple = nullptr;
-  MQTTClientCallbackAdvancedFunction functionAdvanced = nullptr;
+  MQTT_CB_FUNC_SIMPLE = 4,
+  MQTT_CB_FUNC_ADVANCED = 5,
+  MQTT_CB_FUNC_RAW = 6
 #endif
+};
+
+// Optimized callback structure using union - saves 48+ bytes vs storing all pointers
+typedef struct {
+  MQTTClient *client;
+  MQTTCallbackType type;
+  union {
+    MQTTClientCallbackSimple simple;
+    MQTTClientCallbackAdvanced advanced;
+    MQTTClientCallbackRaw raw;
+#if MQTT_HAS_FUNCTIONAL
+    // Note: std::function may need placement new/delete for proper lifecycle
+    MQTTClientCallbackSimpleFunction funcSimple;
+    MQTTClientCallbackAdvancedFunction funcAdvanced;
+    MQTTClientCallbackRawFunction funcRaw;
+#endif
+  };
+  
+  // Constructor to ensure clean initialization
+  void clear() {
+    type = MQTT_CB_NONE;
+    simple = nullptr;
+  }
 } MQTTClientCallback;
 
 class MQTTClient {
  private:
-  size_t readBufSize = 0;
-  size_t writeBufSize = 0;
+  // Pointers (8 bytes on 64-bit, 4 on 32-bit)
   uint8_t *readBuf = nullptr;
   uint8_t *writeBuf = nullptr;
-
-  uint16_t keepAlive = 10;
-  bool cleanSession = true;
-  uint32_t timeout = 1000;
-  bool _sessionPresent = false;
-
   Client *netClient = nullptr;
   const char *hostname = nullptr;
-  IPAddress address;
-  int port = 0;
   lwmqtt_will_t *will = nullptr;
-  MQTTClientCallback callback;
 
+  // Structs (contain pointers and data)
+  MQTTClientCallback callback;
   lwmqtt_arduino_network_t network = {nullptr};
   lwmqtt_arduino_timer_t timer1 = {0, 0, nullptr};
   lwmqtt_arduino_timer_t timer2 = {0, 0, nullptr};
   lwmqtt_client_t client = lwmqtt_client_t();
+  IPAddress address;
 
-  bool _connected = false;
+  // 4-byte aligned data
+  size_t readBufSize = 0;
+  size_t writeBufSize = 0;
+  uint32_t timeout = 1000;
+  uint32_t _droppedMessages = 0;
+  int port = 0;
+
+  // 2-byte aligned data
+  uint16_t keepAlive = 10;
   uint16_t nextDupPacketID = 0;
+
+  // 1-byte aligned data
+  bool cleanSession = true;
+  bool _sessionPresent = false;
+  bool _connected = false;
+  
+  // Enums (usually int, but can be smaller)
   lwmqtt_return_code_t _returnCode = (lwmqtt_return_code_t)0;
   lwmqtt_err_t _lastError = (lwmqtt_err_t)0;
-  uint32_t _droppedMessages = 0;
 
  public:
   void *ref = nullptr;
 
-  explicit MQTTClient(int bufSize = 128) : MQTTClient(bufSize, bufSize) {}
+  // Default buffer size reduced to 64 bytes (was 128) - sufficient for most topics/payloads
+  // Use larger buffers explicitly if needed: MQTTClient mqtt(256);
+  explicit MQTTClient(int bufSize = 64) : MQTTClient(bufSize, bufSize) {}
   MQTTClient(int readBufSize, int writeBufSize);
 
   ~MQTTClient();
@@ -115,9 +166,11 @@ class MQTTClient {
 
   void onMessage(MQTTClientCallbackSimple cb);
   void onMessageAdvanced(MQTTClientCallbackAdvanced cb);
+  void onMessageRaw(MQTTClientCallbackRaw cb);
 #if MQTT_HAS_FUNCTIONAL
   void onMessage(MQTTClientCallbackSimpleFunction cb);
   void onMessageAdvanced(MQTTClientCallbackAdvancedFunction cb);
+  void onMessageRaw(MQTTClientCallbackRawFunction cb);
 #endif
 
   void setClockSource(MQTTClientClockSource cb);
@@ -186,12 +239,17 @@ class MQTTClient {
   bool connected();
   bool sessionPresent() { return this->_sessionPresent; }
 
+    // Expose buffer info for internal handlers (kept small to avoid copying)
+    uint8_t *readBufferPtr() { return this->readBuf; }
+    size_t readBufferSize() const { return this->readBufSize; }
+
   lwmqtt_err_t lastError() { return this->_lastError; }
   lwmqtt_return_code_t returnCode() { return this->_returnCode; }
 
   bool disconnect();
 
  private:
+    void destroyCallback();
   void close();
 };
 

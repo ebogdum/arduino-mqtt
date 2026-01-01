@@ -55,16 +55,11 @@ void lwmqtt_drop_overflow(lwmqtt_client_t *client, bool enabled, uint32_t *count
 }
 
 static uint16_t lwmqtt_get_next_packet_id(lwmqtt_client_t *client) {
-  // check overflow
-  if (client->last_packet_id == 65535) {
-    client->last_packet_id = 1;
-    return 1;
-  }
-
-  // increment packet id
-  client->last_packet_id++;
-
-  return client->last_packet_id;
+  // Increment and wrap (0 is not valid, so wrap from 65535 to 1)
+  uint16_t id = client->last_packet_id + 1;
+  if (id == 0) id = 1;  // Skip 0 on overflow
+  client->last_packet_id = id;
+  return id;
 }
 
 static lwmqtt_err_t lwmqtt_read_from_network(lwmqtt_client_t *client, size_t offset, size_t len) {

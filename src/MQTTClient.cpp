@@ -1,172 +1,160 @@
 #include "MQTTClient.h"
 
-inline void lwmqtt_arduino_timer_set(void *ref, uint32_t timeout) {
-  // cast timer reference
+MQTT_ALWAYS_INLINE void lwmqtt_arduino_timer_set(void *ref, uint32_t timeout) {
   auto t = (lwmqtt_arduino_timer_t *)ref;
-
-  // set timeout
   t->timeout = timeout;
-
-  // set start
-  if (t->millis != nullptr) {
-    t->start = t->millis();
-  } else {
-    t->start = millis();
-  }
+  t->start = (t->millis != nullptr) ? t->millis() : millis();
 }
 
-inline int32_t lwmqtt_arduino_timer_get(void *ref) {
-  // cast timer reference
+MQTT_ALWAYS_INLINE int32_t lwmqtt_arduino_timer_get(void *ref) {
   auto t = (lwmqtt_arduino_timer_t *)ref;
-
-  // get now
-  uint32_t now;
-  if (t->millis != nullptr) {
-    now = t->millis();
-  } else {
-    now = millis();
-  }
-
-  // get difference (account for roll-overs)
-  uint32_t diff;
-  if (now < t->start) {
-    diff = UINT32_MAX - t->start + now;
-  } else {
-    diff = now - t->start;
-  }
-
-  // return relative time
-  if (diff > t->timeout) {
-    return -(diff - t->timeout);
-  } else {
-    return t->timeout - diff;
-  }
+  
+  // Get current time from custom source or Arduino millis
+  uint32_t now = (t->millis != nullptr) ? t->millis() : millis();
+  
+  // Unsigned subtraction automatically handles rollover correctly
+  uint32_t elapsed = now - t->start;
+  
+  // Return remaining time (negative if expired)
+  return (int32_t)(t->timeout - elapsed);
 }
 
-inline lwmqtt_err_t lwmqtt_arduino_network_read(void *ref, uint8_t *buffer, size_t len, size_t *read,
+MQTT_ALWAYS_INLINE lwmqtt_err_t lwmqtt_arduino_network_read(void *ref, uint8_t *buffer, size_t len, size_t *read,
                                                 uint32_t timeout) {
-  // cast network reference
   auto n = (lwmqtt_arduino_network_t *)ref;
-
-  // set timeout
   uint32_t start = millis();
-
-  // reset counter
   *read = 0;
 
-  // read until all bytes have been read or timeout has been reached
-  while (len > 0 && (millis() - start < timeout)) {
-    // read from connection
-    int r = n->client->read(buffer, len);
+  while (len > 0) {
+    // Check timeout using unsigned subtraction (handles rollover)
+    if (millis() - start >= timeout) {
+      break;
+    }
 
-    // handle read data
+    int r = n->client->read(buffer, len);
     if (r > 0) {
       buffer += r;
       *read += r;
       len -= r;
-      continue;
-    }
-
-    // wait/unblock for some time (RTOS based boards may otherwise fail since
-    // the wifi task cannot provide the data)
-    delay(1);
-
-    // otherwise check status
-    if (!n->client->connected()) {
-      return LWMQTT_NETWORK_FAILED_READ;
+    } else {
+      // Yield to RTOS/WiFi task
+      yield();
+      
+      // Check connection if no data is available
+      if (!n->client->connected()) {
+        return LWMQTT_NETWORK_FAILED_READ;
+      }
     }
   }
 
-  // check counter
-  if (*read == 0) {
-    return LWMQTT_NETWORK_TIMEOUT;
-  }
-
-  return LWMQTT_SUCCESS;
+  return (*read == 0) ? LWMQTT_NETWORK_TIMEOUT : LWMQTT_SUCCESS;
 }
 
-inline lwmqtt_err_t lwmqtt_arduino_network_write(void *ref, uint8_t *buffer, size_t len, size_t *sent,
+MQTT_ALWAYS_INLINE lwmqtt_err_t lwmqtt_arduino_network_write(void *ref, uint8_t *buffer, size_t len, size_t *sent,
                                                  uint32_t /*timeout*/) {
-  // cast network reference
   auto n = (lwmqtt_arduino_network_t *)ref;
-
-  // write bytes
   *sent = n->client->write(buffer, len);
-  if (*sent <= 0) {
-    return LWMQTT_NETWORK_FAILED_WRITE;
-  }
-
-  return LWMQTT_SUCCESS;
+  return (*sent > 0) ? LWMQTT_SUCCESS : LWMQTT_NETWORK_FAILED_WRITE;
 }
 
 static void MQTTClientHandler(lwmqtt_client_t * /*client*/, void *ref, lwmqtt_string_t topic,
                               lwmqtt_message_t message) {
-  // get callback
   auto cb = (MQTTClientCallback *)ref;
+  
+  // Quick exit if no callback set
+  if (cb->type == MQTT_CB_NONE) return;
 
-  // null terminate topic
-  char terminated_topic[topic.len + 1];
-  memcpy(terminated_topic, topic.data, topic.len);
-  terminated_topic[topic.len] = '\0';
+  // Zero-copy path: raw callbacks get untouched buffers and lengths (no mutation, no allocation)
+  switch (cb->type) {
+    case MQTT_CB_RAW:
+      cb->raw(cb->client, topic.data, topic.len, (const char *)message.payload, message.payload_len);
+      return;
+#if MQTT_HAS_FUNCTIONAL
+    case MQTT_CB_FUNC_RAW:
+      cb->funcRaw(cb->client, topic.data, topic.len, (const char *)message.payload, message.payload_len);
+      return;
+#endif
+    default:
+      break;  // fall through to legacy paths that need C-strings/String
+  }
 
-  // null terminate payload if available
-  if (message.payload != nullptr) {
+  // Legacy paths below may require C-string termination; do so only when safe
+  uint8_t *buf_base = cb->client ? cb->client->readBufferPtr() : nullptr;
+  size_t buf_cap = cb->client ? cb->client->readBufferSize() + 1 : 0;  // +1 reserved by constructor
+  uint8_t *buf_end = buf_base ? buf_base + buf_cap : nullptr;
+
+  auto can_terminate = [&](const char *ptr, size_t len) -> bool {
+    if (buf_base == nullptr) return false;
+    const uint8_t *p = reinterpret_cast<const uint8_t *>(ptr);
+    return p >= buf_base && (p + len) < buf_end;  // strictly within reserved space
+  };
+
+  if (can_terminate(topic.data, topic.len)) {
+    topic.data[topic.len] = '\0';
+  }
+
+  if (message.payload != nullptr && can_terminate(reinterpret_cast<char *>(message.payload), message.payload_len)) {
     message.payload[message.payload_len] = '\0';
   }
 
-  // call the advanced callback and return if available
-  if (cb->advanced != nullptr) {
-    cb->advanced(cb->client, terminated_topic, (char *)message.payload, (int)message.payload_len);
-    return;
-  }
+  // Dispatch based on callback type (union-based)
+  switch (cb->type) {
+    case MQTT_CB_ADVANCED:
+      cb->advanced(cb->client, topic.data, (char *)message.payload, (int)message.payload_len);
+      return;
+
 #if MQTT_HAS_FUNCTIONAL
-  if (cb->functionAdvanced != nullptr) {
-    cb->functionAdvanced(cb->client, terminated_topic, (char *)message.payload, (int)message.payload_len);
-    return;
-  }
+    case MQTT_CB_FUNC_ADVANCED:
+      cb->funcAdvanced(cb->client, topic.data, (char *)message.payload, (int)message.payload_len);
+      return;
+
+    case MQTT_CB_FUNC_SIMPLE: {
+      String str_topic(topic.data, topic.len);
+      String str_payload((message.payload != nullptr) ? String((const char *)message.payload, message.payload_len) : String());
+      cb->funcSimple(str_topic, str_payload);
+      return;
+    }
 #endif
 
-  // return if simple callback is not set
-#if MQTT_HAS_FUNCTIONAL
-  if (cb->simple == nullptr && cb->functionSimple == nullptr) {
-    return;
+    case MQTT_CB_SIMPLE: {
+      String str_topic(topic.data, topic.len);
+      String str_payload((message.payload != nullptr) ? String((const char *)message.payload, message.payload_len) : String());
+      cb->simple(str_topic, str_payload);
+      return;
+    }
+    
+    default:
+      return;
   }
-#else
-  if (cb->simple == nullptr) {
-    return;
-  }
-#endif
-
-  // create topic string
-  String str_topic = String(terminated_topic);
-
-  // create payload string
-  String str_payload;
-  if (message.payload != nullptr) {
-    str_payload = String((const char *)message.payload);
-  }
-
-  // call simple callback
-#if MQTT_HAS_FUNCTIONAL
-  if (cb->functionSimple != nullptr) {
-    cb->functionSimple(str_topic, str_payload);
-  } else {
-    cb->simple(str_topic, str_payload);
-  }
-#else
-  cb->simple(str_topic, str_payload);
-#endif
 }
 
 MQTTClient::MQTTClient(int readBufSize, int writeBufSize) {
-  // allocate buffers
+  // Store buffer sizes
   this->readBufSize = (size_t)readBufSize;
   this->writeBufSize = (size_t)writeBufSize;
-  this->readBuf = (uint8_t *)malloc((size_t)readBufSize + 1);
-  this->writeBuf = (uint8_t *)malloc((size_t)writeBufSize);
+  
+  // Allocate buffers (+1 for read buffer to allow null termination)
+  this->readBuf = (uint8_t *)malloc(this->readBufSize + 1);
+  this->writeBuf = (uint8_t *)malloc(this->writeBufSize);
+
+   // Abort early if allocation failed; keep pointers null to prevent deref later
+   if (this->readBuf == nullptr || this->writeBuf == nullptr) {
+     free(this->readBuf);
+     free(this->writeBuf);
+     this->readBuf = nullptr;
+     this->writeBuf = nullptr;
+     this->readBufSize = 0;
+     this->writeBufSize = 0;
+   }
+  
+  // Initialize callback to none
+  this->callback.client = nullptr;
+  this->callback.type = MQTT_CB_NONE;
+  this->callback.simple = nullptr;
 }
 
 MQTTClient::~MQTTClient() {
+  this->destroyCallback();
   // free will
   this->clearWill();
 
@@ -181,6 +169,11 @@ MQTTClient::~MQTTClient() {
 }
 
 void MQTTClient::begin(Client &_client) {
+  // Abort if buffers were not allocated
+  if (this->readBuf == nullptr || this->writeBuf == nullptr) {
+    this->_lastError = LWMQTT_BUFFER_TOO_SHORT;
+    return;
+  }
   // set client
   this->netClient = &_client;
 
@@ -198,44 +191,46 @@ void MQTTClient::begin(Client &_client) {
 }
 
 void MQTTClient::onMessage(MQTTClientCallbackSimple cb) {
-  // set callback
+  this->destroyCallback();
   this->callback.client = this;
+  this->callback.type = MQTT_CB_SIMPLE;
   this->callback.simple = cb;
-  this->callback.advanced = nullptr;
-#if MQTT_HAS_FUNCTIONAL
-  this->callback.functionSimple = nullptr;
-  this->callback.functionAdvanced = nullptr;
-#endif
 }
 
 void MQTTClient::onMessageAdvanced(MQTTClientCallbackAdvanced cb) {
-  // set callback
+  this->destroyCallback();
   this->callback.client = this;
-  this->callback.simple = nullptr;
+  this->callback.type = MQTT_CB_ADVANCED;
   this->callback.advanced = cb;
-#if MQTT_HAS_FUNCTIONAL
-  this->callback.functionSimple = nullptr;
-  this->callback.functionAdvanced = nullptr;
-#endif
+}
+
+void MQTTClient::onMessageRaw(MQTTClientCallbackRaw cb) {
+  this->destroyCallback();
+  this->callback.client = this;
+  this->callback.type = MQTT_CB_RAW;
+  this->callback.raw = cb;
 }
 
 #if MQTT_HAS_FUNCTIONAL
 void MQTTClient::onMessage(MQTTClientCallbackSimpleFunction cb) {
-  // set callback
+  this->destroyCallback();
   this->callback.client = this;
-  this->callback.simple = nullptr;
-  this->callback.functionSimple = cb;
-  this->callback.advanced = nullptr;
-  this->callback.functionAdvanced = nullptr;
+  this->callback.type = MQTT_CB_FUNC_SIMPLE;
+  new (&this->callback.funcSimple) MQTTClientCallbackSimpleFunction(cb);
 }
 
 void MQTTClient::onMessageAdvanced(MQTTClientCallbackAdvancedFunction cb) {
-  // set callback
+  this->destroyCallback();
   this->callback.client = this;
-  this->callback.simple = nullptr;
-  this->callback.functionSimple = nullptr;
-  this->callback.advanced = nullptr;
-  this->callback.functionAdvanced = cb;
+  this->callback.type = MQTT_CB_FUNC_ADVANCED;
+  new (&this->callback.funcAdvanced) MQTTClientCallbackAdvancedFunction(cb);
+}
+
+void MQTTClient::onMessageRaw(MQTTClientCallbackRawFunction cb) {
+  this->destroyCallback();
+  this->callback.client = this;
+  this->callback.type = MQTT_CB_FUNC_RAW;
+  new (&this->callback.funcRaw) MQTTClientCallbackRawFunction(cb);
 }
 #endif
 
@@ -262,27 +257,38 @@ void MQTTClient::setHost(const char _hostname[], int _port) {
 }
 
 void MQTTClient::setWill(const char topic[], const char payload[], bool retained, int qos) {
-  // return if topic is missing
-  if (topic == nullptr || strlen(topic) == 0) {
+  // Quick validation
+  if (topic == nullptr || *topic == '\0') {
     return;
   }
 
-  // clear existing will
+  // Clear any existing will
   this->clearWill();
 
-  // allocate will
+  // Allocate and zero-initialize will structure
   this->will = (lwmqtt_will_t *)malloc(sizeof(lwmqtt_will_t));
+  if (this->will == nullptr) return;
   memset(this->will, 0, sizeof(lwmqtt_will_t));
 
-  // set topic
-  this->will->topic = lwmqtt_string(strdup(topic));
+  // Set topic (strdup handles strlen internally)
+  char *topic_copy = strdup(topic);
+  if (topic_copy == nullptr) {
+    this->clearWill();
+    return;
+  }
+  this->will->topic = lwmqtt_string(topic_copy);
 
-  // set payload if available
-  if (payload != nullptr && strlen(payload) > 0) {
-    this->will->payload = lwmqtt_string(strdup(payload));
+  // Set payload if provided
+  if (payload != nullptr && *payload != '\0') {
+    char *payload_copy = strdup(payload);
+    if (payload_copy == nullptr) {
+      this->clearWill();
+      return;
+    }
+    this->will->payload = lwmqtt_string(payload_copy);
   }
 
-  // set flags
+  // Set flags
   this->will->retained = retained;
   this->will->qos = (lwmqtt_qos_t)qos;
 }
@@ -492,9 +498,8 @@ bool MQTTClient::loop() {
 }
 
 bool MQTTClient::connected() {
-  // a client is connected if the network is connected, a client is available and
-  // the connection has been properly initiated
-  return this->netClient != nullptr && this->netClient->connected() == 1 && this->_connected;
+  // Check internal flag first (cheapest), then validate network state
+  return this->_connected && this->netClient != nullptr && this->netClient->connected() == 1;
 }
 
 bool MQTTClient::disconnect() {
@@ -518,4 +523,25 @@ void MQTTClient::close() {
 
   // close network
   this->netClient->stop();
+}
+
+void MQTTClient::destroyCallback() {
+#if MQTT_HAS_FUNCTIONAL
+  // Explicitly destroy active std::function instances in the union
+  switch (this->callback.type) {
+    case MQTT_CB_FUNC_SIMPLE:
+      this->callback.funcSimple.~MQTTClientCallbackSimpleFunction();
+      break;
+    case MQTT_CB_FUNC_ADVANCED:
+      this->callback.funcAdvanced.~MQTTClientCallbackAdvancedFunction();
+      break;
+    case MQTT_CB_FUNC_RAW:
+      this->callback.funcRaw.~MQTTClientCallbackRawFunction();
+      break;
+    default:
+      break;
+  }
+#endif
+  this->callback.type = MQTT_CB_NONE;
+  this->callback.simple = nullptr;
 }

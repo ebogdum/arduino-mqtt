@@ -20,19 +20,19 @@ lwmqtt_string_t lwmqtt_string(const char *str) {
 }
 
 int lwmqtt_strcmp(lwmqtt_string_t a, const char *b) {
-  // get string of b
-  lwmqtt_string_t b_str = lwmqtt_string(b);
-
-  // return if both are zero length
-  if (a.len == 0 && b_str.len == 0) {
-    return 0;
+  // Handle null/empty b string
+  if (b == NULL || *b == '\0') {
+    return (a.len == 0) ? 0 : 1;
   }
 
-  // return if lengths are different
-  if (a.len != b_str.len) {
-    return -1;
+  // Get length of b without creating a struct
+  size_t b_len = strlen(b);
+
+  // Return if lengths are different
+  if (a.len != b_len) {
+    return (a.len < b_len) ? -1 : 1;
   }
 
-  // compare memory of same length
-  return strncmp(a.data, b_str.data, a.len);
+  // Compare memory of same length
+  return memcmp(a.data, b, a.len);
 }
