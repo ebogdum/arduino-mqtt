@@ -83,7 +83,7 @@ enum MQTTCallbackType : uint8_t {
 };
 
 // Optimized callback structure using union - saves 48+ bytes vs storing all pointers
-typedef struct {
+struct MQTTClientCallback {
   MQTTClient *client;
   MQTTCallbackType type;
   union {
@@ -91,19 +91,38 @@ typedef struct {
     MQTTClientCallbackAdvanced advanced;
     MQTTClientCallbackRaw raw;
 #if MQTT_HAS_FUNCTIONAL
-    // Note: std::function may need placement new/delete for proper lifecycle
     MQTTClientCallbackSimpleFunction funcSimple;
     MQTTClientCallbackAdvancedFunction funcAdvanced;
     MQTTClientCallbackRawFunction funcRaw;
 #endif
   };
   
-  // Constructor to ensure clean initialization
+  MQTTClientCallback() : client(nullptr), type(MQTT_CB_NONE), simple(nullptr) {}
+
+  ~MQTTClientCallback() {
+#if MQTT_HAS_FUNCTIONAL
+    switch (type) {
+      case MQTT_CB_FUNC_SIMPLE:
+        funcSimple.~MQTTClientCallbackSimpleFunction();
+        break;
+      case MQTT_CB_FUNC_ADVANCED:
+        funcAdvanced.~MQTTClientCallbackAdvancedFunction();
+        break;
+      case MQTT_CB_FUNC_RAW:
+        funcRaw.~MQTTClientCallbackRawFunction();
+        break;
+      default:
+        break;
+    }
+#endif
+  }
+
   void clear() {
+    this->~MQTTClientCallback();
     type = MQTT_CB_NONE;
     simple = nullptr;
   }
-} MQTTClientCallback;
+};
 
 class MQTTClient {
  private:

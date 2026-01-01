@@ -526,22 +526,5 @@ void MQTTClient::close() {
 }
 
 void MQTTClient::destroyCallback() {
-#if MQTT_HAS_FUNCTIONAL
-  // Explicitly destroy active std::function instances in the union
-  switch (this->callback.type) {
-    case MQTT_CB_FUNC_SIMPLE:
-      this->callback.funcSimple.~MQTTClientCallbackSimpleFunction();
-      break;
-    case MQTT_CB_FUNC_ADVANCED:
-      this->callback.funcAdvanced.~MQTTClientCallbackAdvancedFunction();
-      break;
-    case MQTT_CB_FUNC_RAW:
-      this->callback.funcRaw.~MQTTClientCallbackRawFunction();
-      break;
-    default:
-      break;
-  }
-#endif
-  this->callback.type = MQTT_CB_NONE;
-  this->callback.simple = nullptr;
+  this->callback.clear();
 }
